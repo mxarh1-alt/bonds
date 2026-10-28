@@ -1,0 +1,392 @@
+﻿Attribute VB_Name = "modBondMoexAudit273"
+Option Explicit
+
+' MOEX audit v2.7.3. Read-only for all existing portfolio worksheets.
+' Writes ONLY worksheet "MOEX Audit v273".
+' Uses the historical MOEX yields table, not the current quote.
+' Does not send any order or modify transactions, cash, YTM, or coupon schedule.
+
+Private Const V273_REPORT As String = "MOEX Audit v273"
+Private Const V273_MODEL As String = "YTM и дюрация"
+Private Const V273_REFERENCE As String = "Справочник"
+Private Const V273_PRICE_TOL_PP As Double = 0.15
+Private Const V273_YTM_TOL_PP As Double = 0.2
+
+Public Sub BondV273_CheckThree()
+    On Error GoTo FatalError
+    Dim report As Worksheet, model As Worksheet, refSheet As Worksheet
+    Dim ids As Variant, i As Long, hitCount As Long, total As Long
+    Dim secId As String, boardid As String, bondTitle As String, modelISIN As String
+    Dim modelRow As Long, targetRow As Long, info As String
+    Dim priceDate As Date, modelPrice As Double, modelYTM As Double
+    Dim reqUrl As String, payload As String
+    Dim moexDate As String, moexType As String, result As String
+    Dim moexPrice As Double, moexYTM As Double, moexDuration As Double
+    Dim ok As Boolean
+
+    Set model = ThisWorkbook.Worksheets(V273_MODEL)
+    Set refSheet = ThisWorkbook.Worksheets(V273_REFERENCE)
+    Set report = V273PrepareReport()
+
+    ' Only three test instruments; identifiers have been anonymized for independent review.
+    ids = Array("TEST_ISIN_01", "TEST_ISIN_02", "TEST_ISIN_03")
+    total = UBound(ids) - LBound(ids) + 1
+
+    For i = LBound(ids) To UBound(ids)
+        targetRow = 6 + i - LBound(ids)
+        modelISIN = CStr(ids(i))
+        report.Cells(targetRow, 1).value = modelISIN
+        modelRow = V273FindRow(model, modelISIN, 13, 500)
+        If modelRow = 0 Then
+            report.Cells(targetRow, 14).value = "НЕТ МОДЕЛИ"
+            report.Cells(targetRow, 16).value = "В листе YTM и дюрация отсутствует ISIN"
+            GoTo NextInstrument
+        End If
+
+        bondTitle = CStr(model.Cells(modelRow, 2).value)
+        secId = Trim$(CStr(model.Cells(modelRow, 4).value))
+        boardid = V273BoardByISIN(refSheet, modelISIN)
+        report.Cells(targetRow, 2).value = secId
+        report.Cells(targetRow, 3).value = boardid
+        report.Cells(targetRow, 16).value = bondTitle
+        If Len(secId) = 0 Or (boardid <> "TQOB" And boardid <> "TQCB") Then
+            report.Cells(targetRow, 14).value = "НЕТ SECID / BOARD"
+            GoTo NextInstrument
+        End If
+        If Not IsDate(model.Cells(modelRow, 10).value) Then
+            report.Cells(targetRow, 14).value = "НЕТ ДАТЫ МОДЕЛИ"
+            GoTo NextInstrument
+        End If
+        If Not IsNumeric(model.Cells(modelRow, 6).value) Or Not IsNumeric(model.Cells(modelRow, 15).value) Then
+            report.Cells(targetRow, 14).value = "НЕТ ЧИСЛОВОЙ YTM"
+            GoTo NextInstrument
+        End If
+
+        priceDate = CDate(model.Cells(modelRow, 10).value)
+        modelPrice = CDbl(model.Cells(modelRow, 6).value)
+        modelYTM = CDbl(model.Cells(modelRow, 15).value) * 100#
+        report.Cells(targetRow, 4).value = priceDate
+        report.Cells(targetRow, 5).value = modelPrice
+        report.Cells(targetRow, 6).value = modelYTM
+
+        reqUrl = "https://iss.moex.com/iss/history/engines/stock/markets/bonds/boards/" _
+            & boardid & "/yields/" & secId & ".json?from=" & Format$(priceDate, "yyyy-mm-dd") _
+            & "&till=" & Format$(priceDate, "yyyy-mm-dd") & "&iss.meta=off"
+        report.Cells(targetRow, 15).value = reqUrl
+        payload = V273Download(reqUrl, info)
+        If Len(payload) = 0 Then
+            report.Cells(targetRow, 14).value = "НЕ УДАЛОСЬ ЗАГРУЗИТЬ"
+            report.Cells(targetRow, 16).value = info
+            GoTo NextInstrument
+        End If
+
+        ok = V273PickHistoricalYield(payload, secId, Format$(priceDate, "yyyy-mm-dd"), _
+             modelPrice, moexDate, moexPrice, moexYTM, moexDuration, moexType, info)
+        If Not ok Then
+            report.Cells(targetRow, 14).value = "НЕТ СОПОСТАВИМОЙ СТРОКИ"
+            report.Cells(targetRow, 16).value = info
+            GoTo NextInstrument
+        End If
+
+        report.Cells(targetRow, 7).value = moexDate
+        report.Cells(targetRow, 8).value = moexPrice
+        report.Cells(targetRow, 9).value = moexYTM
+        If moexDuration > 0 Then report.Cells(targetRow, 10).value = moexDuration
+        report.Cells(targetRow, 11).value = moexType
+        report.Cells(targetRow, 12).value = Round(moexPrice - modelPrice, 6)
+        report.Cells(targetRow, 13).value = Round(moexYTM - modelYTM, 6)
+        hitCount = hitCount + 1
+
+        If Abs(moexPrice - modelPrice) > V273_PRICE_TOL_PP Then
+            result = "ЦЕНЫ НЕ СОВПАЛИ"
+        ElseIf Abs(moexYTM - modelYTM) > V273_YTM_TOL_PP Then
+            result = "МЕТОДИКУ СВЕРИТЬ"
+        Else
+            result = "ЗНАЧЕНИЯ БЛИЗКИ"
+        End If
+        report.Cells(targetRow, 14).value = result
+        info = "MOEX EFFECTIVEYIELD; не гарантия погашения или доходности"
+        If modelYTM > 100# Then info = info & "; АНОМАЛЬНАЯ YTM: проверить кредитный риск"
+        If Len(moexType) > 0 Then info = info & "; тип даты доходности: " & moexType
+        report.Cells(targetRow, 16).value = info
+NextInstrument:
+        DoEvents
+    Next i
+
+    report.columns("A:P").AutoFit
+    report.columns("O").ColumnWidth = 55
+    report.columns("P").ColumnWidth = 80
+    report.Range("D6:D8").NumberFormat = "dd.mm.yyyy"
+    report.Range("E6:F8").NumberFormat = "0.00"
+    report.Range("H6:I8").NumberFormat = "0.00"
+    report.Range("J6:J8").NumberFormat = "0"
+    report.Range("L6:M8").NumberFormat = "0.000"
+    report.Activate
+    MsgBox "Проверка исторической доходности MOEX завершена." & vbCrLf & _
+        "Инструментов: " & total & vbCrLf & _
+        "Получены сопоставимые исторические строки: " & hitCount & vbCrLf & _
+        "Результат на листе: " & V273_REPORT & vbCrLf & vbCrLf & _
+        "Это независимая сверка данных, НЕ сигнал покупки.", vbInformation, "MOEX Audit v2.7.3"
+    Exit Sub
+FatalError:
+    MsgBox "Аудит остановлен. Другие листы не изменялись." & vbCrLf & Err.description, _
+        vbExclamation, "MOEX Audit v2.7.3"
+End Sub
+
+Private Function V273PrepareReport() As Worksheet
+    Dim sh As Worksheet, headers As Variant, k As Long
+    On Error Resume Next
+    Set sh = ThisWorkbook.Worksheets(V273_REPORT)
+    On Error GoTo 0
+    If sh Is Nothing Then
+        Set sh = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.count))
+        sh.name = V273_REPORT
+    End If
+    sh.Cells.Clear
+    sh.Range("A1:P1").Merge
+    sh.Range("A1").value = "MOEX AUDIT v2.7.3  |  ИСТОРИЧЕСКАЯ ДОХОДНОСТЬ"
+    With sh.Range("A1:P1")
+        .Interior.Color = RGB(24, 57, 83)
+        .Font.Color = vbWhite
+        .Font.Bold = True
+        .Font.Size = 15
+        .RowHeight = 32
+    End With
+    sh.Range("A2:P2").Merge
+    sh.Range("A2").value = "Тест 3 выпусков: строго на дату исходной цены. Без сделок, без изменения модели."
+    sh.Range("A3:P3").Merge
+    sh.Range("A3").value = "Совпадение цифр не подтверждает исполнение погашения, кредитный рейтинг или доступную цену покупки."
+    headers = Array("ISIN", "SECID", "BOARD", "Дата модели", "Цена модели, %", _
+        "YTM модели, %", "Дата MOEX", "Цена MOEX, %", "EFFECTIVEYIELD MOEX, %", _
+        "Дюрация MOEX, дн.", "Тип даты YTM", "Разница цен, п.п.", _
+        "Разница YTM, п.п.", "Статус", "Источник ISS", "Пояснение")
+    For k = 0 To UBound(headers)
+        sh.Cells(5, k + 1).value = CStr(headers(k))
+    Next k
+    With sh.Range("A5:P5")
+        .Interior.Color = RGB(24, 57, 83)
+        .Font.Color = vbWhite
+        .Font.Bold = True
+        .WrapText = True
+        .RowHeight = 37
+    End With
+    sh.Range("A6:P8").Interior.Color = RGB(235, 246, 252)
+    sh.Range("A10").value = "Правило: дата и цена должны совпадать. Сравниваем только EFFECTIVEYIELD, а не YIELDCLOSE."
+    sh.Range("A11").value = "Если ISS вернул пустой ответ или иной метод расчёта, отмечаем отсутствие проверки. Никаких подставных значений."
+    sh.Range("A12").value = "Разница YTM допустима для изучения, но не является основанием покупки; параметры оферт и погашений ещё не подтверждены."
+    Set V273PrepareReport = sh
+End Function
+
+Private Function V273FindRow(ByVal sh As Worksheet, ByVal key As String, _
+                             ByVal firstRow As Long, ByVal lastRow As Long) As Long
+    Dim rr As Long
+    For rr = firstRow To lastRow
+        If StrComp(Trim$(CStr(sh.Cells(rr, 1).value)), key, vbTextCompare) = 0 Then
+            V273FindRow = rr
+            Exit Function
+        End If
+    Next rr
+End Function
+
+Private Function V273BoardByISIN(ByVal sh As Worksheet, ByVal isin As String) As String
+    Dim rr As Long
+    rr = V273FindRow(sh, isin, 2, 300)
+    If rr > 0 Then V273BoardByISIN = UCase$(Trim$(CStr(sh.Cells(rr, 3).value)))
+End Function
+
+Private Function V273Download(ByVal url As String, ByRef errText As String) As String
+    On Error GoTo Failed
+    Dim http As Object
+    Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
+    http.SetTimeouts 5000, 5000, 10000, 15000
+    http.Open "GET", url, False
+    http.SetRequestHeader "User-Agent", "BondAudit/2.7.3"
+    http.Send
+    If http.status <> 200 Then
+        errText = "MOEX HTTP " & CStr(http.status)
+        Exit Function
+    End If
+    V273Download = CStr(http.responseText)
+    Exit Function
+Failed:
+    errText = "Сбой обращения к MOEX: " & Err.description
+End Function
+
+Private Function V273PickHistoricalYield(ByVal raw As String, ByVal secId As String, _
+        ByVal desiredDate As String, ByVal modelPrice As Double, _
+        ByRef tradeDate As String, ByRef price As Double, ByRef yieldPct As Double, _
+        ByRef durationDays As Double, ByRef yieldType As String, ByRef message As String) As Boolean
+    On Error GoTo Failed
+    Dim columns As Collection, dataRows As Collection, aRow As Collection
+    Dim i As Long, ixDate As Long, ixSEC As Long, ixPrice As Long
+    Dim ixYield As Long, ixDuration As Long, ixType As Long
+    Dim found As Boolean, diff As Double, bestDiff As Double
+    Dim candidatePrice As Double, candidateYield As Double
+    Dim rowDate As String, rowSEC As String
+
+    Set columns = V273GetArray(raw, "history_yields", "columns")
+    Set dataRows = V273GetArray(raw, "history_yields", "data")
+    If columns Is Nothing Or dataRows Is Nothing Then
+        message = "Ответ ISS не содержит history_yields:columns/data. Поля API необходимо проверить."
+        Exit Function
+    End If
+    ixDate = V273ColumnIndex(columns, "TRADEDATE")
+    ixSEC = V273ColumnIndex(columns, "SECID")
+    ixPrice = V273ColumnIndex(columns, "PRICE")
+    ixYield = V273ColumnIndex(columns, "EFFECTIVEYIELD")
+    ixDuration = V273ColumnIndex(columns, "DURATION")
+    ixType = V273ColumnIndex(columns, "YIELDDATETYPE")
+    If ixDate = 0 Or ixPrice = 0 Or ixYield = 0 Then
+        message = "Нет обязательных полей TRADEDATE/PRICE/EFFECTIVEYIELD."
+        Exit Function
+    End If
+    bestDiff = 1E+90
+    For i = 1 To dataRows.count
+        If IsObject(dataRows(i)) Then
+            Set aRow = dataRows(i)
+            rowDate = V273ReadCell(aRow, ixDate)
+            If ixSEC > 0 Then
+                rowSEC = V273ReadCell(aRow, ixSEC)
+                If Len(rowSEC) > 0 And StrComp(rowSEC, secId, vbTextCompare) <> 0 Then GoTo nextRow
+            End If
+            If StrComp(rowDate, desiredDate, vbTextCompare) <> 0 Then GoTo nextRow
+            If Not V273ValidNumber(V273ReadCell(aRow, ixPrice)) Then GoTo nextRow
+            If Not V273ValidNumber(V273ReadCell(aRow, ixYield)) Then GoTo nextRow
+            candidatePrice = val(V273ReadCell(aRow, ixPrice))
+            candidateYield = val(V273ReadCell(aRow, ixYield))
+            If candidatePrice <= 0 Or candidateYield < 0 Then GoTo nextRow
+            diff = Abs(candidatePrice - modelPrice)
+            If diff < bestDiff Then
+                bestDiff = diff
+                tradeDate = rowDate
+                price = candidatePrice
+                yieldPct = candidateYield
+                If ixDuration > 0 Then
+                    If V273ValidNumber(V273ReadCell(aRow, ixDuration)) Then _
+                        durationDays = val(V273ReadCell(aRow, ixDuration))
+                End If
+                If ixType > 0 Then yieldType = V273ReadCell(aRow, ixType)
+                found = True
+            End If
+        End If
+nextRow:
+    Next i
+    If Not found Then
+        message = "На заданную дату нет строки с числовыми PRICE и EFFECTIVEYIELD. Не подменяем другой датой."
+    Else
+        V273PickHistoricalYield = True
+    End If
+    Exit Function
+Failed:
+    message = "Не удалось разобрать ответ history_yields: " & Err.description
+End Function
+
+Private Function V273ColumnIndex(ByVal cols As Collection, ByVal key As String) As Long
+    Dim k As Long
+    For k = 1 To cols.count
+        If StrComp(CStr(cols(k)), key, vbTextCompare) = 0 Then
+            V273ColumnIndex = k
+            Exit Function
+        End If
+    Next k
+End Function
+
+Private Function V273ReadCell(ByVal items As Collection, ByVal ind As Long) As String
+    If ind < 1 Or ind > items.count Then Exit Function
+    If Not IsObject(items(ind)) Then V273ReadCell = Trim$(CStr(items(ind)))
+End Function
+
+Private Function V273ValidNumber(ByVal value As String) As Boolean
+    If Len(value) = 0 Then Exit Function
+    Dim ch As String, i As Long
+    For i = 1 To Len(value)
+        ch = mid$(value, i, 1)
+        If InStr("0123456789.-+eE", ch) = 0 Then Exit Function
+    Next i
+    V273ValidNumber = True
+End Function
+
+' Minimal, isolated JSON parser for numeric/string arrays in MOEX ISS replies.
+' Does not require an external JSON library or trust arbitrary downloaded code.
+Private Function V273GetArray(ByVal raw As String, ByVal sectionName As String, _
+                              ByVal fieldName As String) As Collection
+    Dim p As Long, q As Long, pos As Long
+    p = InStr(1, raw, """" & sectionName & """", vbTextCompare)
+    If p = 0 Then Exit Function
+    q = InStr(p, raw, """" & fieldName & """", vbTextCompare)
+    If q = 0 Then Exit Function
+    pos = InStr(q, raw, "[")
+    If pos = 0 Then Exit Function
+    Set V273GetArray = V273ParseArray(raw, pos)
+End Function
+
+Private Function V273ParseArray(ByVal raw As String, ByRef pos As Long) As Collection
+    Dim results As New Collection, nested As Collection, token As String, startPos As Long
+    V273SkipWhite raw, pos
+    If mid$(raw, pos, 1) <> "[" Then Err.Raise 5, , "JSON: ожидался массив"
+    pos = pos + 1
+    Do While pos <= Len(raw)
+        V273SkipWhite raw, pos
+        Select Case mid$(raw, pos, 1)
+            Case "]"
+                pos = pos + 1
+                Exit Do
+            Case ","
+                pos = pos + 1
+            Case "["
+                Set nested = V273ParseArray(raw, pos)
+                results.Add nested
+            Case """"
+                token = V273ParseString(raw, pos)
+                results.Add token
+            Case Else
+                startPos = pos
+                Do While pos <= Len(raw)
+                    If InStr(",]", mid$(raw, pos, 1)) > 0 Then Exit Do
+                    pos = pos + 1
+                Loop
+                token = Trim$(mid$(raw, startPos, pos - startPos))
+                If StrComp(token, "null", vbTextCompare) = 0 Then token = ""
+                results.Add token
+        End Select
+    Loop
+    Set V273ParseArray = results
+End Function
+
+Private Function V273ParseString(ByVal raw As String, ByRef pos As Long) As String
+    Dim ch As String, esc As String, out As String
+    If mid$(raw, pos, 1) <> """" Then Err.Raise 5, , "JSON: ожидалась строка"
+    pos = pos + 1
+    Do While pos <= Len(raw)
+        ch = mid$(raw, pos, 1)
+        If ch = """" Then
+            pos = pos + 1
+            V273ParseString = out
+            Exit Function
+        ElseIf ch = "\" Then
+            pos = pos + 1
+            esc = mid$(raw, pos, 1)
+            Select Case esc
+                Case """", "\", "/"
+                    out = out & esc
+                Case "n", "r"
+                    out = out & " "
+                Case "t"
+                    out = out & " "
+                Case Else
+                    out = out & esc
+            End Select
+        Else
+            out = out & ch
+        End If
+        pos = pos + 1
+    Loop
+    Err.Raise 5, , "JSON: незавершённая строка"
+End Function
+
+Private Sub V273SkipWhite(ByVal raw As String, ByRef pos As Long)
+    Do While pos <= Len(raw)
+        If InStr(" " & vbCr & vbLf & vbTab, mid$(raw, pos, 1)) = 0 Then Exit Do
+        pos = pos + 1
+    Loop
+End Sub

@@ -1,0 +1,257 @@
+﻿Attribute VB_Name = "modBondYtmAudit271"
+Option Explicit
+
+' Local, read-only reconciliation of the existing YTM report.
+' Does not access the internet and does NOT certify issuer repayments.
+' Source sheets stay unchanged. Only the dedicated audit sheet is written.
+
+Public Sub BondYTM_AuditV271()
+    Dim wsY As Worksheet, wsE As Worksheet, wsOut As Worksheet
+    Dim lastY As Long, lastE As Long, i As Long, j As Long, outRow As Long
+    Dim isinCode As String, eventType As String, eventId As String
+    Dim quoteDate As Double, eventDate As Double, dirtyPrice As Double
+    Dim currentFace As Double, amount As Double, paidPrincipal As Double
+    Dim unknownCount As Long, duplicateCount As Long, paymentCount As Long
+    Dim flowDates() As Double, flowAmounts() As Double
+    Dim seen As Object, ytmCalc As Double, macaulay As Double
+    Dim modDuration As Double, dv01Calc As Double, modelYTM As Double
+    Dim statusText As String, noteText As String, hasYtm As Boolean
+    Dim mathChecked As Long, unknownIssues As Long, mismatchCount As Long
+    Dim oldSheetAlerts As Boolean, isCoupon As Boolean
+
+    On Error GoTo AuditError
+    Set wsY = ThisWorkbook.Worksheets("YTM и дюрация")
+    Set wsE = ThisWorkbook.Worksheets("График выплат")
+
+    Set wsOut = Nothing
+    On Error Resume Next
+    Set wsOut = ThisWorkbook.Worksheets("YTM Audit v271")
+    On Error GoTo AuditError
+    If Not wsOut Is Nothing Then
+        If MsgBox("Обновить только лист YTM Audit v271? Остальные листы не меняются.", _
+                  vbYesNo + vbQuestion, "YTM v2.7.1") <> vbYes Then Exit Sub
+        wsOut.Cells.Clear
+    Else
+        Set wsOut = ThisWorkbook.Worksheets.Add(After:=wsY)
+        wsOut.name = "YTM Audit v271"
+    End If
+
+    wsOut.Range("A1:P1").Merge
+    wsOut.Range("A1").value = "YTM AUDIT v2.7.1 - локальная математическая сверка"
+    wsOut.Range("A2:P2").Merge
+    wsOut.Range("A2").value = "НЕ проверяет биржевую доходность, кредитный риск, оферты или факт будущего погашения"
+    wsOut.Range("A4:P4").value = Array("ISIN", "Выпуск", "Дата цены", _
+       "YTM модели, %", "YTM контроль, %", "Разница, п.п.", _
+       "Маколей модели, лет", "Маколей контроль, лет", _
+       "DV01 модели, руб./шт", "DV01 контроль, руб./шт", _
+       "Неизвестных купонов", "Возврат номинала", "Номинал сейчас", _
+       "Дубли ID", "Контроль математики", "Ограничения")
+
+    lastY = wsY.Cells(wsY.rows.count, 1).End(xlUp).row
+    lastE = wsE.Cells(wsE.rows.count, 2).End(xlUp).row
+    outRow = 5
+
+    For i = 13 To lastY
+        isinCode = Trim$(CStr(wsY.Cells(i, 1).Value2))
+        If Len(isinCode) = 0 Then GoTo NextBond
+        If Not IsNumeric(wsY.Cells(i, 10).Value2) Then GoTo NextBond
+        quoteDate = CDbl(wsY.Cells(i, 10).Value2)
+        dirtyPrice = Audit271Number(wsY.Cells(i, 9).Value2)
+        currentFace = Audit271Number(wsY.Cells(i, 8).Value2)
+        paidPrincipal = 0#
+        unknownCount = 0
+        duplicateCount = 0
+        paymentCount = 0
+        ReDim flowDates(1 To lastE + 2)
+        ReDim flowAmounts(1 To lastE + 2)
+        Set seen = CreateObject("Scripting.Dictionary")
+
+        For j = 2 To lastE
+            If StrComp(Trim$(CStr(wsE.Cells(j, 2).Value2)), isinCode, vbTextCompare) = 0 Then
+                eventId = Trim$(CStr(wsE.Cells(j, 1).Value2))
+                If Len(eventId) > 0 Then
+                    If seen.exists(eventId) Then
+                        duplicateCount = duplicateCount + 1
+                    Else
+                        seen.Add eventId, True
+                    End If
+                End If
+
+                If IsNumeric(wsE.Cells(j, 3).Value2) Then
+                    eventDate = CDbl(wsE.Cells(j, 3).Value2)
+                    If eventDate > quoteDate Then
+                        eventType = Trim$(CStr(wsE.Cells(j, 4).Value2))
+                        isCoupon = (StrComp(eventType, "Купон", vbTextCompare) = 0)
+                        If isCoupon Then
+                            If IsNumeric(wsE.Cells(j, 10).Value2) Then
+                                amount = CDbl(wsE.Cells(j, 10).Value2)
+                                If amount > 0 Then
+                                    paymentCount = paymentCount + 1
+                                    flowDates(paymentCount) = (eventDate - quoteDate) / 365#
+                                    flowAmounts(paymentCount) = amount
+                                End If
+                            Else
+                                unknownCount = unknownCount + 1
+                            End If
+                        End If
+
+                        If IsNumeric(wsE.Cells(j, 11).Value2) Then
+                            amount = CDbl(wsE.Cells(j, 11).Value2)
+                            If amount > 0 Then
+                                paidPrincipal = paidPrincipal + amount
+                                paymentCount = paymentCount + 1
+                                flowDates(paymentCount) = (eventDate - quoteDate) / 365#
+                                flowAmounts(paymentCount) = amount
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Next j
+
+        wsOut.Cells(outRow, 1).value = isinCode
+        wsOut.Cells(outRow, 2).value = wsY.Cells(i, 2).Value2
+        wsOut.Cells(outRow, 3).Value2 = quoteDate
+        wsOut.Cells(outRow, 12).value = paidPrincipal
+        wsOut.Cells(outRow, 13).value = currentFace
+        wsOut.Cells(outRow, 11).value = unknownCount
+        wsOut.Cells(outRow, 14).value = duplicateCount
+
+        hasYtm = False
+        noteText = "Внешняя сверка погашения/оферты и сопоставление НКД с датой цены не проведены"
+        If unknownCount > 0 Then
+            statusText = "НЕИЗВЕСТНЫЕ КУПОНЫ"
+            unknownIssues = unknownIssues + 1
+        ElseIf duplicateCount > 0 Then
+            statusText = "ДУБЛИ ID"
+            mismatchCount = mismatchCount + 1
+        ElseIf dirtyPrice <= 0 Or currentFace <= 0 Or paymentCount = 0 Then
+            statusText = "НЕТ ИСХОДНЫХ ДАННЫХ"
+            mismatchCount = mismatchCount + 1
+        ElseIf Abs(paidPrincipal - currentFace) > 0.1 Then
+            statusText = "НЕ СХОДИТСЯ НОМИНАЛ"
+            mismatchCount = mismatchCount + 1
+        ElseIf Not IsNumeric(wsY.Cells(i, 15).Value2) Then
+            statusText = "НЕТ YTM В ОТЧЕТЕ"
+            mismatchCount = mismatchCount + 1
+        Else
+            hasYtm = Audit271Solve(flowDates, flowAmounts, paymentCount, dirtyPrice, ytmCalc)
+            If hasYtm Then
+                modelYTM = CDbl(wsY.Cells(i, 15).Value2)
+                macaulay = Audit271Macaulay(flowDates, flowAmounts, paymentCount, ytmCalc, dirtyPrice)
+                modDuration = macaulay / (1# + ytmCalc)
+                dv01Calc = dirtyPrice * modDuration * 0.0001
+                wsOut.Cells(outRow, 4).value = modelYTM
+                wsOut.Cells(outRow, 5).value = ytmCalc
+                wsOut.Cells(outRow, 6).value = (ytmCalc - modelYTM) * 100#
+                wsOut.Cells(outRow, 7).value = wsY.Cells(i, 16).Value2
+                wsOut.Cells(outRow, 8).value = macaulay
+                wsOut.Cells(outRow, 9).value = wsY.Cells(i, 18).Value2
+                wsOut.Cells(outRow, 10).value = dv01Calc
+                If Abs(ytmCalc - modelYTM) < 0.000001 And _
+                   Abs(macaulay - Audit271Number(wsY.Cells(i, 16).Value2)) < 0.001 And _
+                   Abs(dv01Calc - Audit271Number(wsY.Cells(i, 18).Value2)) < 0.001 Then
+                    statusText = "МАТЕМАТИКА OK"
+                    mathChecked = mathChecked + 1
+                Else
+                    statusText = "РАСХОЖДЕНИЕ РАСЧЕТОВ"
+                    mismatchCount = mismatchCount + 1
+                End If
+            Else
+                statusText = "YTM НЕ РЕШЕНА"
+                mismatchCount = mismatchCount + 1
+            End If
+        End If
+        wsOut.Cells(outRow, 15).value = statusText
+        wsOut.Cells(outRow, 16).value = noteText
+        outRow = outRow + 1
+NextBond:
+    Next i
+
+    With wsOut
+        .rows(1).RowHeight = 28
+        .rows(4).RowHeight = 38
+        .Range("A1:P1").Interior.Color = RGB(24, 58, 83)
+        .Range("A1:P1").Font.Color = vbWhite
+        .Range("A1:P1").Font.Bold = True
+        .Range("A4:P4").Interior.Color = RGB(24, 58, 83)
+        .Range("A4:P4").Font.Color = vbWhite
+        .Range("A4:P4").Font.Bold = True
+        .Range("A4:P4").WrapText = True
+        .Range("A5:A" & outRow - 1).NumberFormat = "@"
+        .Range("C5:C" & outRow - 1).NumberFormat = "dd.mm.yyyy"
+        .Range("D5:E" & outRow - 1).NumberFormat = "0.00%"
+        .Range("F5:J" & outRow - 1).NumberFormat = "0.000000"
+        .Range("L5:M" & outRow - 1).NumberFormat = "# ##0.00"
+        .columns("A").ColumnWidth = 19
+        .columns("B").ColumnWidth = 25
+        .columns("C").ColumnWidth = 15
+        .columns("D:N").ColumnWidth = 17
+        .columns("O").ColumnWidth = 26
+        .columns("P").ColumnWidth = 60
+        .Range("A4:P" & outRow - 1).AutoFilter
+        .Range("R2").value = "Проверены математически"
+        .Range("S2").value = mathChecked
+        .Range("R3").value = "С неизвестными купонами"
+        .Range("S3").value = unknownIssues
+        .Range("R4").value = "Расхождения/ошибки"
+        .Range("S4").value = mismatchCount
+        .Range("R6").value = "ВАЖНО: математическое совпадение не означает подтвержденную YTM Мосбиржи"
+        .columns("R").ColumnWidth = 38
+        .columns("S").ColumnWidth = 17
+    End With
+    MsgBox "Локальная проверка v2.7.1 выполнена." & vbCrLf & _
+           "Математика OK: " & mathChecked & vbCrLf & _
+           "Неизвестные купоны: " & unknownIssues & vbCrLf & _
+           "Расхождения/ошибки: " & mismatchCount & vbCrLf & _
+           "Существующие листы не изменены.", vbInformation, "YTM Audit v2.7.1"
+    Exit Sub
+AuditError:
+    MsgBox "Ошибка аудита: " & Err.description, vbExclamation, "YTM Audit v2.7.1"
+End Sub
+
+Private Function Audit271Number(ByVal val As Variant) As Double
+    If IsNumeric(val) Then Audit271Number = CDbl(val) Else Audit271Number = 0#
+End Function
+
+Private Function Audit271NPV(ByRef times() As Double, ByRef amounts() As Double, _
+                             ByVal n As Long, ByVal yieldRate As Double, _
+                             ByVal dirtyPrice As Double) As Double
+    Dim p As Long, total As Double
+    total = -dirtyPrice
+    For p = 1 To n
+        total = total + amounts(p) / ((1# + yieldRate) ^ times(p))
+    Next p
+    Audit271NPV = total
+End Function
+
+Private Function Audit271Solve(ByRef times() As Double, ByRef amounts() As Double, _
+                               ByVal n As Long, ByVal dirtyPrice As Double, _
+                               ByRef resultYield As Double) As Boolean
+    Dim lowY As Double, highY As Double, midY As Double, iter As Long
+    lowY = -0.9
+    highY = 100#
+    If Audit271NPV(times, amounts, n, lowY, dirtyPrice) <= 0 Then Exit Function
+    If Audit271NPV(times, amounts, n, highY, dirtyPrice) >= 0 Then Exit Function
+    For iter = 1 To 120
+        midY = (lowY + highY) / 2#
+        If Audit271NPV(times, amounts, n, midY, dirtyPrice) > 0 Then
+            lowY = midY
+        Else
+            highY = midY
+        End If
+    Next iter
+    resultYield = (lowY + highY) / 2#
+    Audit271Solve = True
+End Function
+
+Private Function Audit271Macaulay(ByRef times() As Double, ByRef amounts() As Double, _
+                                  ByVal n As Long, ByVal yieldRate As Double, _
+                                  ByVal dirtyPrice As Double) As Double
+    Dim p As Long, weighted As Double
+    For p = 1 To n
+        weighted = weighted + times(p) * amounts(p) / _
+                   ((1# + yieldRate) ^ times(p))
+    Next p
+    Audit271Macaulay = weighted / dirtyPrice
+End Function
